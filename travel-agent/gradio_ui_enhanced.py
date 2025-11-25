@@ -382,11 +382,11 @@ python test_langgraph_agent.py
 # Comprehensive durability tests (includes PostgreSQL if available)
 python test_agent_durability.py
 
-# CLI mode testing
-python main.py --mode cli
+# Web UI testing (this interface)
+python main.py web
 
 # Single request testing
-python main.py --mode single --destination "Tokyo, Japan" --start-date "2025-06-01" --end-date "2025-06-07" --travelers 2
+python main.py single --destination "Tokyo, Japan" --start-date "2025-06-01" --end-date "2025-06-07" --travelers 2
             """, language="bash")
             
             gr.Markdown("""

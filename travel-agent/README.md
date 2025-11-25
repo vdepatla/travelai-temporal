@@ -89,15 +89,10 @@ python main.py web --share
 
 Then open your browser to `http://localhost:7860`
 
-### Command Line Interface
+### Quick Single Request
 ```bash
-python main.py cli
+python main.py single --destination "Tokyo, Japan" --start-date "2025-06-01" --end-date "2025-06-07" --travelers 2
 ```
-
-Example interaction:
-```
-> Tokyo, 2025-06-01, 2025-06-07, 2
-🔄 Planning trip to Tokyo for 2 traveler(s)
    Dates: 2025-06-01 to 2025-06-07
    Please wait...
 

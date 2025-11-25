@@ -1,11 +1,11 @@
 """
 Main Entry Point for LangGraph Travel Agent
 
-This is the primary entry point for running the travel agent system.
+This is the primary entry point for running the travel agent chatbot.
 It supports multiple modes of operation:
-- Web UI (Gradio)
-- Command line interface
-- API server mode
+- Web UI (Gradio) - Interactive chat interface
+- Single request mode - One-time travel planning
+- Benchmark mode - Performance testing
 """
 
 import asyncio
@@ -48,94 +48,6 @@ async def create_agent_with_fallback(prefer_postgres: bool = True) -> LangGraphT
     
     return LangGraphTravelAgent(use_postgres=False)
 
-
-async def run_cli_mode():
-    """
-    Command line interface for the travel agent
-    """
-    print("🌍 Welcome to the LangGraph Travel Agent!")
-    print("Type 'quit' or 'exit' to end the session.\n")
-    
-    # Try PostgreSQL first, fallback to memory
-    agent = await create_agent_with_fallback()
-    
-    while True:
-        try:
-            # Get user input
-            print("Tell me about your travel plans:")
-            user_input = input("> ").strip()
-            
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                print("Thank you for using the Travel Agent! Safe travels! 🛫")
-                break
-            
-            if not user_input:
-                continue
-            
-            # For CLI, let's use a simple format: destination, start_date, end_date, travelers
-            # Example: "Tokyo, 2025-06-01, 2025-06-07, 2"
-            parts = [part.strip() for part in user_input.split(',')]
-            
-            if len(parts) >= 3:
-                destination = parts[0]
-                start_date = parts[1] if len(parts) > 1 else "2025-06-01"
-                end_date = parts[2] if len(parts) > 2 else "2025-06-07"
-                travelers = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
-            else:
-                # Fallback for simple destination input
-                destination = user_input
-                start_date = "2025-06-01"
-                end_date = "2025-06-07"
-                travelers = 1
-            
-            print(f"\n🔄 Planning trip to {destination} for {travelers} traveler(s)")
-            print(f"   Dates: {start_date} to {end_date}")
-            print("   Please wait...\n")
-            
-            # Create and run request
-            request = TravelRequest(
-                destination=destination,
-                start_date=start_date,
-                end_date=end_date,
-                number_of_travelers=travelers
-            )
-            
-            result = await agent.run(request)
-            
-            if result["success"]:
-                print("✅ Travel Plan Created Successfully!")
-                print("=" * 50)
-                
-                # Flight details
-                flight = result["flight_details"]
-                print(f"✈️  Flight: {flight.airline} {flight.flight_number}")
-                print(f"   Dates: {flight.departure_date} to {flight.return_date}")
-                print(f"   Price: ${flight.price}")
-                
-                # Accommodation details
-                hotel = result["accommodation_details"]
-                print(f"\n🏨 Hotel: {hotel.hotel_name}")
-                print(f"   Check-in: {hotel.check_in_date}")
-                print(f"   Check-out: {hotel.check_out_date}")
-                print(f"   Total: ${hotel.total_price}")
-                
-                # Itinerary
-                print(f"\n📋 Itinerary:")
-                print(result["itinerary"])
-                
-                print("\n" + "=" * 50)
-                
-            else:
-                print(f"❌ Error: {result['error']}")
-            
-            print("\n")
-            
-        except KeyboardInterrupt:
-            print("\n\nGoodbye! 👋")
-            break
-        except Exception as e:
-            print(f"❌ Error: {str(e)}")
-            print("Please try again.\n")
 
 
 def run_web_ui(port: int = 7860, share: bool = False):
@@ -240,7 +152,7 @@ def main():
     parser = argparse.ArgumentParser(description="LangGraph Travel Agent")
     parser.add_argument(
         "mode",
-        choices=["web", "cli", "single", "benchmark"],
+        choices=["web", "single", "benchmark"],
         help="Operation mode"
     )
     parser.add_argument("--port", type=int, default=7860, help="Port for web UI")
@@ -254,9 +166,6 @@ def main():
     
     if args.mode == "web":
         run_web_ui(port=args.port, share=args.share)
-    
-    elif args.mode == "cli":
-        asyncio.run(run_cli_mode())
     
     elif args.mode == "single":
         if not args.destination:
