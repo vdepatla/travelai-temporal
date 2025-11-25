@@ -17,8 +17,7 @@ import asyncio
 import json
 from typing import Dict, List, Any, Literal
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemoryCheckpointSaver
-from langgraph.checkpoint.postgres import PostgresCheckpointSaver
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel
 from src.models.travel_models import TravelRequest, FlightDetails, AccommodationDetails
 
@@ -55,13 +54,20 @@ class PureLangGraphTravelAgent:
     def __init__(self, use_postgres: bool = False):
         # Choose checkpointer based on production needs
         if use_postgres:
-            # For production: persistent state across restarts
-            self.checkpointer = PostgresCheckpointSaver.from_conn_string(
-                "postgresql://user:pass@localhost/langgraph"
-            )
+            # For production: try to use PostgreSQL if available
+            try:
+                from langgraph.checkpoint.postgres import PostgresCheckpointSaver
+                self.checkpointer = PostgresCheckpointSaver.from_conn_string(
+                    "postgresql://user:pass@localhost/langgraph"
+                )
+                print("✅ Using PostgreSQL for state persistence")
+            except Exception as e:
+                print(f"⚠️  PostgreSQL not available, using memory: {e}")
+                self.checkpointer = MemorySaver()
         else:
             # For development: in-memory state
-            self.checkpointer = MemoryCheckpointSaver()
+            self.checkpointer = MemorySaver()
+            print("📝 Using in-memory checkpointer (development mode)")
         
         self.graph = self._build_graph()
     

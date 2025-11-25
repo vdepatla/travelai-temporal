@@ -19,8 +19,7 @@ import os
 from typing import Dict, List, Any, Literal, Optional
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemoryCheckpointSaver
-from langgraph.checkpoint.postgres import PostgresCheckpointSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.models.travel_models import TravelRequest, FlightDetails, AccommodationDetails
 from src.agents.flight_search_agent import LangGraphFlightSearchAgent
@@ -30,9 +29,9 @@ from src.agents.itinerary_agent import LangGraphItineraryAgent
 
 class TravelPlanningState(BaseModel):
     """Shared state for the entire travel planning system"""
-    request: TravelRequest
-    flight_details: Optional[FlightDetails] = None
-    accommodation_details: Optional[AccommodationDetails] = None
+    request: Dict[str, Any]  # Changed from TravelRequest to dict for serialization
+    flight_details: Dict[str, Any] = {}  # Changed from FlightDetails to dict
+    accommodation_details: Dict[str, Any] = {}  # Changed from AccommodationDetails to dict
     itinerary: Optional[str] = None
     agent_messages: List[Dict[str, Any]] = []
     completed_tasks: List[str] = []
@@ -82,14 +81,20 @@ class LangGraphTravelAgent:
                 )
             
             try:
+                # Try to import and use PostgreSQL checkpointer only when needed
+                from langgraph.checkpoint.postgres import PostgresCheckpointSaver
                 self.checkpointer = PostgresCheckpointSaver.from_conn_string(connection_string)
-                print(f"✅ Using PostgreSQL checkpointer: {connection_string.split('@')[1] if '@' in connection_string else connection_string}")
+                print("✅ Using PostgreSQL for state persistence")
+            except ImportError:
+                print("⚠️  PostgreSQL checkpointer not available, using memory checkpointer")
+                self.checkpointer = MemorySaver()
+                self.use_postgres = False
             except Exception as e:
                 print(f"⚠️  PostgreSQL connection failed, falling back to memory: {str(e)}")
-                self.checkpointer = MemoryCheckpointSaver()
+                self.checkpointer = MemorySaver()
                 self.use_postgres = False
         else:
-            self.checkpointer = MemoryCheckpointSaver()
+            self.checkpointer = MemorySaver()
             print("📝 Using in-memory checkpointer (development mode)")
         
         # Build the coordination workflow
@@ -101,7 +106,6 @@ class LangGraphTravelAgent:
         
         # Add coordination nodes
         workflow.add_node("supervisor", self._supervisor)
-        workflow.add_node("parallel_coordinator", self._parallel_coordinator)
         workflow.add_node("flight_coordinator", self._flight_coordinator)
         workflow.add_node("accommodation_coordinator", self._accommodation_coordinator)
         workflow.add_node("itinerary_coordinator", self._itinerary_coordinator)
@@ -116,23 +120,12 @@ class LangGraphTravelAgent:
             "supervisor",
             self._route_from_supervisor,
             {
-                "parallel_search": "parallel_coordinator",
+                "flight_search": "flight_coordinator",
+                "accommodation_search": "accommodation_coordinator",
                 "create_itinerary": "itinerary_coordinator",
                 "get_feedback": "human_feedback",
                 "complete": "result_aggregator",
                 "end": END
-            }
-        )
-        
-        # Parallel coordination routes
-        workflow.add_conditional_edges(
-            "parallel_coordinator",
-            self._route_parallel_tasks,
-            {
-                "both": ["flight_coordinator", "accommodation_coordinator"],
-                "flight_only": "flight_coordinator",
-                "accommodation_only": "accommodation_coordinator",
-                "supervisor": "supervisor"
             }
         )
         
@@ -150,9 +143,13 @@ class LangGraphTravelAgent:
         """Route decisions from the supervisor"""
         completed = set(state.completed_tasks)
         
-        # If nothing started, begin parallel search
+        # If nothing started, begin with flight search
         if not completed:
-            return "parallel_search"
+            return "flight_search"
+        
+        # If flight done but not accommodation, do accommodation
+        if "flight_search" in completed and "accommodation_search" not in completed:
+            return "accommodation_search"
         
         # If searches done but no itinerary, create one
         if {"flight_search", "accommodation_search"}.issubset(completed):
@@ -168,29 +165,17 @@ class LangGraphTravelAgent:
         
         return "end"
     
-    def _route_parallel_tasks(self, state: TravelPlanningState) -> str:
-        """Route parallel task execution"""
-        completed = set(state.completed_tasks)
-        
-        if "flight_search" not in completed and "accommodation_search" not in completed:
-            return "both"
-        elif "flight_search" not in completed:
-            return "flight_only"
-        elif "accommodation_search" not in completed:
-            return "accommodation_only"
-        else:
-            return "supervisor"
-    
     async def _supervisor(self, state: TravelPlanningState) -> TravelPlanningState:
         """
         Supervisor Agent: High-level coordination and decision making
         """
-        print(f"🧠 Supervisor: Coordinating travel to {state.request.destination}")
+        destination = state.request["destination"]
+        print(f"🧠 Supervisor: Coordinating travel to {destination}")
         
         state.agent_messages.append({
             "agent": "supervisor",
             "action": "coordinating",
-            "message": f"Planning trip to {state.request.destination} for {state.request.number_of_travelers} travelers",
+            "message": f"Planning trip to {destination} for {state.request['number_of_travelers']} travelers",
             "timestamp": asyncio.get_event_loop().time()
         })
         
@@ -206,21 +191,6 @@ class LangGraphTravelAgent:
         print(f"🧠 Supervisor: Remaining tasks: {remaining}")
         return state
     
-    async def _parallel_coordinator(self, state: TravelPlanningState) -> TravelPlanningState:
-        """
-        Coordinate parallel execution of flight and accommodation search
-        """
-        print("🔄 Parallel Coordinator: Managing parallel searches")
-        
-        state.parallel_tasks_running = True
-        state.agent_messages.append({
-            "agent": "parallel_coordinator",
-            "action": "coordinating_parallel",
-            "message": "Starting parallel flight and accommodation searches"
-        })
-        
-        return state
-    
     async def _flight_coordinator(self, state: TravelPlanningState) -> TravelPlanningState:
         """
         Coordinate flight search operations
@@ -228,24 +198,36 @@ class LangGraphTravelAgent:
         if "flight_search" in state.completed_tasks:
             return state
         
-        print(f"✈️ Flight Coordinator: Searching flights to {state.request.destination}")
+        destination = state.request["destination"]
+        print(f"✈️ Flight Coordinator: Searching flights to {destination}")
         
         try:
-            state.flight_details = await self.flight_agent.run(state.request)
+            # Convert dict back to TravelRequest for the agent
+            request = TravelRequest(
+                destination=state.request["destination"],
+                start_date=state.request["start_date"],
+                end_date=state.request["end_date"],
+                number_of_travelers=state.request["number_of_travelers"]
+            )
+            
+            flight_details = await self.flight_agent.run(request)
+            state.flight_details = {
+                "airline": flight_details.airline,
+                "flight_number": flight_details.flight_number,
+                "departure_time": flight_details.departure_time,
+                "arrival_time": flight_details.arrival_time,
+                "price": flight_details.price
+            }
             state.completed_tasks.append("flight_search")
             
             state.agent_messages.append({
                 "agent": "flight_coordinator",
                 "action": "completed",
-                "result": f"Found {state.flight_details.airline} flight {state.flight_details.flight_number}",
-                "details": {
-                    "airline": state.flight_details.airline,
-                    "flight_number": state.flight_details.flight_number,
-                    "price": state.flight_details.price
-                }
+                "result": f"Found {flight_details.airline} flight {flight_details.flight_number}",
+                "details": state.flight_details
             })
             
-            print(f"✈️ Flight Coordinator: Found flight {state.flight_details.flight_number}")
+            print(f"✈️ Flight Coordinator: Found flight {flight_details.flight_number}")
             
         except Exception as e:
             state.errors["flight_search"] = str(e)
@@ -265,25 +247,36 @@ class LangGraphTravelAgent:
         if "accommodation_search" in state.completed_tasks:
             return state
         
-        print(f"🏨 Accommodation Coordinator: Searching hotels in {state.request.destination}")
+        destination = state.request["destination"]
+        print(f"🏨 Accommodation Coordinator: Searching hotels in {destination}")
         
         try:
-            state.accommodation_details = await self.accommodation_agent.run(state.request)
+            # Convert dict back to TravelRequest for the agent
+            request = TravelRequest(
+                destination=state.request["destination"],
+                start_date=state.request["start_date"],
+                end_date=state.request["end_date"],
+                number_of_travelers=state.request["number_of_travelers"]
+            )
+            
+            accommodation_details = await self.accommodation_agent.run(request)
+            state.accommodation_details = {
+                "hotel_name": accommodation_details.hotel_name,
+                "check_in_date": accommodation_details.check_in_date,
+                "check_out_date": accommodation_details.check_out_date,
+                "price_per_night": accommodation_details.price_per_night,
+                "total_price": accommodation_details.total_price
+            }
             state.completed_tasks.append("accommodation_search")
             
             state.agent_messages.append({
                 "agent": "accommodation_coordinator",
                 "action": "completed",
-                "result": f"Booked {state.accommodation_details.hotel_name}",
-                "details": {
-                    "hotel_name": state.accommodation_details.hotel_name,
-                    "check_in": state.accommodation_details.check_in_date,
-                    "check_out": state.accommodation_details.check_out_date,
-                    "total_price": state.accommodation_details.total_price
-                }
+                "result": f"Booked {accommodation_details.hotel_name}",
+                "details": state.accommodation_details
             })
             
-            print(f"🏨 Accommodation Coordinator: Booked {state.accommodation_details.hotel_name}")
+            print(f"🏨 Accommodation Coordinator: Booked {accommodation_details.hotel_name}")
             
         except Exception as e:
             state.errors["accommodation_search"] = str(e)
@@ -310,10 +303,34 @@ class LangGraphTravelAgent:
         print("📋 Itinerary Coordinator: Creating comprehensive itinerary")
         
         try:
+            # Convert dicts back to model objects for the agent
+            request = TravelRequest(
+                destination=state.request["destination"],
+                start_date=state.request["start_date"],
+                end_date=state.request["end_date"],
+                number_of_travelers=state.request["number_of_travelers"]
+            )
+            
+            flight_details = FlightDetails(
+                airline=state.flight_details["airline"],
+                flight_number=state.flight_details["flight_number"],
+                departure_time=state.flight_details["departure_time"],
+                arrival_time=state.flight_details["arrival_time"],
+                price=state.flight_details["price"]
+            )
+            
+            accommodation_details = AccommodationDetails(
+                hotel_name=state.accommodation_details["hotel_name"],
+                check_in_date=state.accommodation_details["check_in_date"],
+                check_out_date=state.accommodation_details["check_out_date"],
+                price_per_night=state.accommodation_details["price_per_night"],
+                total_price=state.accommodation_details["total_price"]
+            )
+            
             state.itinerary = await self.itinerary_agent.run(
-                state.request, 
-                state.flight_details, 
-                state.accommodation_details
+                request, 
+                flight_details, 
+                accommodation_details
             )
             state.completed_tasks.append("itinerary_creation")
             
@@ -393,12 +410,22 @@ class LangGraphTravelAgent:
             Complete travel plan with execution details
         """
         if not thread_id:
-            thread_id = f"travel-{hash(str(request))}"
+            # Create a safe thread ID from request properties
+            import uuid
+            request_str = f"{request.destination}-{request.start_date}-{request.end_date}-{request.number_of_travelers}"
+            thread_id = f"travel-{hash(request_str) % 10000}"  # Limit to 4 digits
         
         print(f"🚀 Starting travel planning for thread: {thread_id}")
         
         # Initialize state
-        initial_state = TravelPlanningState(request=request)
+        initial_state = TravelPlanningState(
+            request={
+                "destination": request.destination,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+                "number_of_travelers": request.number_of_travelers
+            }
+        )
         
         # Run the workflow with checkpointing
         config = {"configurable": {"thread_id": thread_id}}
@@ -406,11 +433,32 @@ class LangGraphTravelAgent:
         try:
             final_state = await self.workflow.ainvoke(initial_state, config=config)
             
+            # Convert dictionaries back to model objects for the return value
+            flight_details = None
+            if final_state.flight_details:
+                flight_details = FlightDetails(
+                    airline=final_state.flight_details.get("airline"),
+                    flight_number=final_state.flight_details.get("flight_number"),
+                    departure_time=final_state.flight_details.get("departure_time"),
+                    arrival_time=final_state.flight_details.get("arrival_time"),
+                    price=final_state.flight_details.get("price")
+                )
+            
+            accommodation_details = None
+            if final_state.accommodation_details:
+                accommodation_details = AccommodationDetails(
+                    hotel_name=final_state.accommodation_details.get("hotel_name"),
+                    check_in_date=final_state.accommodation_details.get("check_in_date"),
+                    check_out_date=final_state.accommodation_details.get("check_out_date"),
+                    price_per_night=final_state.accommodation_details.get("price_per_night"),
+                    total_price=final_state.accommodation_details.get("total_price")
+                )
+            
             return {
                 "success": True,
                 "thread_id": thread_id,
-                "flight_details": final_state.flight_details,
-                "accommodation_details": final_state.accommodation_details,
+                "flight_details": flight_details,
+                "accommodation_details": accommodation_details,
                 "itinerary": final_state.itinerary,
                 "agent_messages": final_state.agent_messages,
                 "completed_tasks": final_state.completed_tasks,
@@ -437,9 +485,19 @@ class LangGraphTravelAgent:
         Stream workflow execution for real-time updates
         """
         if not thread_id:
-            thread_id = f"travel-{hash(str(request))}"
+            # Create a safe thread ID from request properties
+            import uuid
+            request_str = f"{request.destination}-{request.start_date}-{request.end_date}-{request.number_of_travelers}"
+            thread_id = f"travel-{hash(request_str) % 10000}"  # Limit to 4 digits
         
-        initial_state = TravelPlanningState(request=request)
+        initial_state = TravelPlanningState(
+            request={
+                "destination": request.destination,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+                "number_of_travelers": request.number_of_travelers
+            }
+        )
         config = {"configurable": {"thread_id": thread_id}}
         
         async for chunk in self.workflow.astream(initial_state, config=config):

@@ -1,12 +1,12 @@
 """
-Improved Pure LangGraph Travel Agent Gradio UI
+Natural Language Travel Chatbot - Gradio UI
 
-This provides an enhanced web interface for local testing with the travel agent system.
+This provides a conversational chat interface for the LangGraph travel agent.
 Features:
-- Structured form inputs for easy testing
-- PostgreSQL status detection
-- Quick test examples
-- Better error handling and display
+- Natural language chat interface
+- Real-time conversation with AI travel assistant
+- Memory persistence across chat sessions
+- Quick examples and structured fallback
 """
 
 import gradio as gr
@@ -15,445 +15,380 @@ import json
 import re
 import os
 import time
-from typing import Tuple
+import uuid
+from typing import List, Tuple, Dict, Any
 from src.models.travel_models import TravelRequest
 from src.agents.travel_agent import LangGraphTravelAgent
 
+# Global variables for agent and chat state
+travel_agent = None
+checkpointer_type = "Memory"
+db_info = "N/A"
 
-# Initialize the travel agent with automatic PostgreSQL detection
-async def initialize_agent():
-    """Initialize agent with automatic PostgreSQL fallback"""
-    # Try PostgreSQL first, fallback to memory
-    postgres_configs = [
-        os.getenv("POSTGRES_CONNECTION_STRING"),
-        "postgresql://postgres:password@localhost:5432/langgraph_checkpoints",
-        "postgresql://postgres@localhost:5432/langgraph_checkpoints",
-        "postgresql://localhost:5432/langgraph_checkpoints"
+def get_or_create_agent():
+    """Get or create the travel agent lazily"""
+    global travel_agent, checkpointer_type, db_info
+    
+    if travel_agent is None:
+        try:
+            # Try PostgreSQL first, fallback to memory
+            postgres_configs = [
+                os.getenv("POSTGRES_CONNECTION_STRING"),
+                "postgresql://postgres:password@localhost:5432/langgraph_checkpoints",
+                "postgresql://postgres@localhost:5432/langgraph_checkpoints", 
+                "postgresql://localhost:5432/langgraph_checkpoints"
+            ]
+            
+            for conn_str in postgres_configs:
+                if conn_str:
+                    try:
+                        agent = LangGraphTravelAgent(use_postgres=True, connection_string=conn_str)
+                        travel_agent = agent
+                        checkpointer_type = "PostgreSQL"
+                        db_info = conn_str.split('@')[1] if '@' in conn_str else "localhost"
+                        return travel_agent, checkpointer_type, db_info
+                    except Exception:
+                        continue
+            
+            # Fallback to memory
+            travel_agent = LangGraphTravelAgent(use_postgres=False)
+            checkpointer_type = "Memory"
+            db_info = "N/A"
+        except Exception as e:
+            print(f"❌ Error initializing agent: {e}")
+            travel_agent = None
+    
+    return travel_agent, checkpointer_type, db_info
+
+def extract_travel_details(message: str) -> Dict[str, Any]:
+    """Extract travel details from natural language message"""
+    details = {
+        "destination": None,
+        "start_date": None,
+        "end_date": None,
+        "travelers": 1
+    }
+    
+    # Simple regex patterns for common travel queries
+    dest_patterns = [
+        r"to\s+([^,\n]+)",
+        r"visit\s+([^,\n]+)",
+        r"trip\s+to\s+([^,\n]+)",
+        r"going\s+to\s+([^,\n]+)",
+        r"travel\s+to\s+([^,\n]+)"
     ]
     
-    for conn_str in postgres_configs:
-        if conn_str:
-            try:
-                agent = LangGraphTravelAgent(use_postgres=True, connection_string=conn_str)
-                info = await agent.get_checkpointer_info()
-                if info["type"] == "PostgreSQL":
-                    return agent, "PostgreSQL", conn_str.split('@')[1] if '@' in conn_str else "localhost"
-            except Exception:
-                continue
+    for pattern in dest_patterns:
+        match = re.search(pattern, message.lower())
+        if match:
+            details["destination"] = match.group(1).strip().title()
+            break
     
-    return LangGraphTravelAgent(use_postgres=False), "Memory", "N/A"
-
-# Initialize agent
-print("🔧 Initializing LangGraph Travel Agent...")
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-travel_agent, checkpointer_type, db_info = loop.run_until_complete(initialize_agent())
-loop.close()
-print(f"✅ Agent initialized with {checkpointer_type} checkpointing")
-
-
-async def plan_trip_structured(destination: str, start_date: str, end_date: str, travelers: int, thread_id: str = "") -> str:
-    """
-    Structured travel planning interface for testing
-    """
-    if not destination or not start_date or not end_date:
-        return "❌ **Error:** Please fill in all required fields (destination, start date, end date)"
+    # Look for dates
+    date_patterns = [
+        r"(\d{4}-\d{2}-\d{2})",
+        r"(\d{1,2}/\d{1,2}/\d{4})",
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}[,\s]*\d{4}"
+    ]
     
-    if travelers <= 0:
-        return "❌ **Error:** Number of travelers must be greater than 0"
+    dates_found = []
+    for pattern in date_patterns:
+        matches = re.findall(pattern, message.lower())
+        dates_found.extend(matches)
+    
+    if len(dates_found) >= 2:
+        details["start_date"] = dates_found[0]
+        details["end_date"] = dates_found[1]
+    elif len(dates_found) == 1:
+        details["start_date"] = dates_found[0]
+    
+    # Look for number of travelers
+    traveler_patterns = [
+        r"(\d+)\s+(?:people|travelers|persons|guests)",
+        r"for\s+(\d+)",
+        r"(\d+)\s+of\s+us"
+    ]
+    
+    for pattern in traveler_patterns:
+        match = re.search(pattern, message.lower())
+        if match:
+            details["travelers"] = int(match.group(1))
+            break
+    
+    return details
+
+async def chat_with_agent(message: str, history: List[Tuple[str, str]], session_id: str) -> Tuple[List[Tuple[str, str]], str]:
+    """
+    Process chat message and return updated history
+    """
+    if not message.strip():
+        return history, ""
     
     try:
-        # Use provided thread ID or generate one
-        if not thread_id.strip():
-            thread_id = f"ui-session-{int(time.time())}"
+        agent, _, _ = get_or_create_agent()
+        if agent is None:
+            error_response = "❌ Sorry, I'm having trouble starting up. Please try again."
+            history.append((message, error_response))
+            return history, ""
         
-        # Create travel request
-        request = TravelRequest(
-            destination=destination.strip(),
-            start_date=start_date.strip(),
-            end_date=end_date.strip(),
-            number_of_travelers=int(travelers)
-        )
+        # Extract travel details from the message
+        travel_details = extract_travel_details(message)
         
-        # Show processing message
-        processing_msg = f"""
-🔄 **Processing your travel request...**
-
-📝 **Request Details:**
-- **Destination:** {destination}
-- **Dates:** {start_date} to {end_date}
-- **Travelers:** {travelers}
-- **Thread ID:** {thread_id}
-- **Checkpointer:** {checkpointer_type}
-
-🤖 **Agent Coordination in Progress:**
-- Flight search agent activating...
-- Accommodation agent standing by...
-- Itinerary agent preparing...
-
-⏳ Please wait while our agents work together...
-"""
+        # Determine if this is a travel planning request
+        travel_keywords = ["trip", "travel", "vacation", "holiday", "visit", "flight", "hotel", "itinerary", "plan"]
+        is_travel_request = any(keyword in message.lower() for keyword in travel_keywords)
         
-        # Run the travel planning
-        result = await travel_agent.run(request, thread_id=thread_id)
-        
-        if result.get("success", False):
-            response = f"""
-✅ **Travel Plan Successfully Created!**
+        if is_travel_request and travel_details["destination"]:
+            # This looks like a travel planning request
+            start_date_display = travel_details.get('start_date', 'I will use default dates')
+            end_date_display = travel_details.get('end_date', 'I will use default dates')
+            thinking_response = f"""🤔 I understand you want to plan a trip! Let me help you with that.
 
-🎯 **Trip Summary:**
-- **Destination:** {destination}
-- **Dates:** {start_date} to {end_date}
-- **Travelers:** {travelers}
-- **Thread ID:** `{thread_id}`
-- **Checkpointer:** {checkpointer_type}
+📍 **Destination**: {travel_details['destination']}
+📅 **Dates**: {start_date_display} to {end_date_display}
+👥 **Travelers**: {travel_details['travelers']}
+
+🔄 Let me search for flights, hotels, and create an itinerary for you..."""
+            
+            history.append((message, thinking_response))
+            
+            # Create travel request
+            request = TravelRequest(
+                destination=travel_details["destination"],
+                start_date=travel_details.get("start_date") or "2025-06-01",
+                end_date=travel_details.get("end_date") or "2025-06-07",
+                number_of_travelers=travel_details["travelers"]
+            )
+            
+            # Process with travel agent
+            result = await agent.run(request, thread_id=session_id)
+            
+            if result["success"]:
+                flight_airline = result['flight_details'].airline if result.get('flight_details') else 'Not found'
+                flight_number = result['flight_details'].flight_number if result.get('flight_details') else 'N/A'
+                flight_price = result['flight_details'].price if result.get('flight_details') else 'N/A'
+                
+                hotel_name = result['accommodation_details'].hotel_name if result.get('accommodation_details') else 'Not found'
+                hotel_checkin = result['accommodation_details'].check_in_date if result.get('accommodation_details') else 'N/A'
+                hotel_price = result['accommodation_details'].total_price if result.get('accommodation_details') else 'N/A'
+                
+                itinerary_text = result.get('itinerary', 'Detailed itinerary will be provided upon booking confirmation.')
+                
+                response = f"""✅ **Perfect! I've planned your trip to {travel_details['destination']}!**
 
 ✈️ **Flight Details:**
-- **Airline:** {result['flight_details'].airline}
-- **Flight Number:** {result['flight_details'].flight_number}
-- **Departure Date:** {result['flight_details'].departure_time}
-- **Return Date:** {result['flight_details'].return_time}
-- **Price:** ${result['flight_details'].price}
+• Airline: {flight_airline}
+• Flight: {flight_number}
+• Price: ${flight_price}
 
-🏨 **Accommodation:**
-- **Hotel:** {result['accommodation_details'].hotel_name}
-- **Address:** {result['accommodation_details'].address}
-- **Check-in:** {result['accommodation_details'].checkin_date}
-- **Check-out:** {result['accommodation_details'].checkout_date}
-- **Price:** ${result['accommodation_details'].price_per_night}/night
+🏨 **Hotel Details:**
+• Hotel: {hotel_name}
+• Check-in: {hotel_checkin}
+• Price: ${hotel_price}
 
-📋 **Detailed Itinerary:**
-{result['itinerary']}
+📋 **Your Itinerary:**
+{itinerary_text}
 
-📊 **Agent Coordination Summary:**
-- **Completed Tasks:** {', '.join(result['completed_tasks'])}
-- **Agent Messages:** {len(result.get('agent_messages', []))}
-- **Processing Time:** ~{len(result['completed_tasks']) * 2}s
-"""
-            
-            if result['errors']:
-                response += f"\n\n⚠️ **Issues Encountered (Handled):**\n"
-                for agent, error in result['errors'].items():
-                    response += f"- **{agent}:** {error}\n"
-            
-            # Add state persistence info
-            if checkpointer_type == "PostgreSQL":
-                response += f"\n\n💾 **State Persistence:** Your trip planning session is saved in PostgreSQL and will survive application restarts."
+💬 **What would you like to do next?**
+• Modify any part of this plan
+• Get more details about activities
+• Ask about local recommendations
+• Start planning another trip"""
+                
+                # Update the last response
+                history[-1] = (history[-1][0], response)
+                
             else:
-                response += f"\n\n⚠️ **State Persistence:** Session is in memory only. Start PostgreSQL with `docker-compose -f docker-compose.local.yml up -d` for persistence."
-            
-            return response
-            
+                error_response = f"❌ I encountered an issue planning your trip: {result.get('error', 'Unknown error')}"
+                history[-1] = (history[-1][0], error_response)
+        
         else:
-            error_msg = result.get('error', 'Unknown error occurred')
-            return f"""
-❌ **Travel Planning Failed**
+            # General travel chat or question
+            if any(word in message.lower() for word in ["hello", "hi", "hey", "start"]):
+                response = """👋 **Hello! I'm your AI Travel Assistant!**
 
-**Error Details:** {error_msg}
+I can help you plan amazing trips around the world! Just tell me:
 
-🛠️ **Troubleshooting:**
-- Check if destination is valid
-- Ensure dates are in YYYY-MM-DD format
-- Verify number of travelers is positive
-- Try a different thread ID if this persists
+💭 **Try saying something like:**
+• "I want to plan a trip to Paris for 2 people"
+• "Help me visit Tokyo from June 1st to June 7th"
+• "Plan a vacation to Rome for 3 travelers"
+• "I need a weekend getaway to Barcelona"
 
-🔧 **System Status:**
-- **Checkpointer:** {checkpointer_type}
-- **Thread ID:** {thread_id}
-"""
-            
+🌍 **I can help you with:**
+• ✈️ Finding flights
+• 🏨 Booking hotels
+• 📋 Creating detailed itineraries
+• 🎯 Local recommendations
+
+**What destination are you dreaming of visiting?**"""
+                
+            elif any(word in message.lower() for word in ["help", "what", "how"]):
+                response = """🤝 **How I Can Help You:**
+
+🗣️ **Just talk naturally!** Tell me about your travel plans in plain English.
+
+**Examples of what you can say:**
+• "I want to go to Japan next month"
+• "Plan a romantic trip to Paris for 2 people"
+• "Help me visit New York from December 15 to 20"
+• "I need a family vacation to Orlando for 4 people"
+
+🎯 **I'll automatically:**
+• Find the best flights
+• Recommend great hotels
+• Create a personalized itinerary
+• Suggest local activities
+
+**Ready to start planning? Just tell me where you'd like to go!**"""
+                
+            else:
+                # Generic helpful response
+                response = """🤔 I'd love to help you with your travel plans! 
+
+To get started, try telling me:
+• Where you want to go
+• When you'd like to travel
+• How many people are traveling
+
+For example: *"I want to plan a trip to Barcelona for 2 people in July"*
+
+**What destination interests you?** ✈️"""
+        
+            history.append((message, response))
+    
     except Exception as e:
-        return f"""
-❌ **System Error**
-
-**Error:** {str(e)}
-
-🔧 **Debug Info:**
-- **Checkpointer:** {checkpointer_type}
-- **Thread ID:** {thread_id}
-- **Destination:** {destination}
-
-💡 **Next Steps:**
-1. Check if all required fields are filled
-2. Verify your OpenAI API key is set
-3. For PostgreSQL issues, check: `docker-compose -f docker-compose.local.yml ps`
-"""
-
-
-def plan_trip_wrapper(*args):
-    """Synchronous wrapper for Gradio"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(plan_trip_structured(*args))
-    loop.close()
-    return result
-
-
-# Create the enhanced Gradio interface
-with gr.Blocks(title="LangGraph Travel Agent - Testing Interface", theme=gr.themes.Soft()) as demo:
+        error_response = f"❌ Sorry, I encountered an error: {str(e)}"
+        history.append((message, error_response))
     
-    # Header with system status
-    gr.Markdown(f"""
-    # 🌍 LangGraph Travel Agent - Testing Interface
+    return history, ""
+
+def start_new_session():
+    """Start a new chat session"""
+    session_id = str(uuid.uuid4())
+    welcome_message = """🌍 **Welcome to your AI Travel Assistant!**
+
+I'm here to help you plan amazing trips around the world!
+
+💭 **Just tell me about your travel plans in natural language:**
+• "I want to visit Paris next month"
+• "Plan a trip to Tokyo for 2 people" 
+• "Help me find a weekend getaway to Rome"
+
+**Where would you like to travel?** ✈️"""
     
-    **Multi-Agent Travel Planning System | Local Testing Environment**
-    
-    🔧 **Status:** {checkpointer_type} Checkpointing | 🗄️ **Database:** {db_info} | 🤖 **Agents:** Flight + Hotel + Itinerary
-    
-    ---
-    """)
-    
-    with gr.Tabs():
-        # Tab 1: Main Testing Interface
-        with gr.TabItem("🎯 Travel Planning"):
-            gr.Markdown("### Plan Your Trip - Testing Interface")
-            
-            with gr.Row():
-                with gr.Column(scale=2):
-                    destination_input = gr.Textbox(
-                        label="🌍 Destination",
-                        placeholder="e.g., Paris, France or Tokyo, Japan",
-                        value="Paris, France"
-                    )
-                with gr.Column(scale=1):
-                    travelers_input = gr.Number(
-                        label="👥 Travelers",
-                        minimum=1,
-                        maximum=10,
-                        value=2
-                    )
-            
-            with gr.Row():
-                start_date_input = gr.Textbox(
-                    label="📅 Start Date (YYYY-MM-DD)",
-                    value="2025-06-01"
-                )
-                end_date_input = gr.Textbox(
-                    label="📅 End Date (YYYY-MM-DD)",
-                    value="2025-06-07"
-                )
-            
-            with gr.Row():
-                thread_id_input = gr.Textbox(
-                    label="🔗 Thread/Session ID (optional)",
-                    placeholder="Leave empty for auto-generated",
-                    value=""
-                )
-                plan_btn = gr.Button("✈️ Plan My Trip", variant="primary", size="lg")
-            
-            # Output area
-            trip_output = gr.Markdown(value="👆 Enter your travel details above and click 'Plan My Trip' to start")
-            
-            # Quick test examples
-            gr.Markdown("### 🧪 Quick Test Scenarios")
-            with gr.Row():
-                example1_btn = gr.Button("🗼 Paris Weekend", variant="secondary")
-                example2_btn = gr.Button("🗾 Tokyo Adventure", variant="secondary") 
-                example3_btn = gr.Button("🍝 Rome Classic", variant="secondary")
-                example4_btn = gr.Button("❌ Error Test", variant="stop")
-            
-            # Example handlers
-            def set_paris_example():
-                return "Paris, France", "2025-06-01", "2025-06-07", 2, "paris-weekend-test"
-            
-            def set_tokyo_example():
-                return "Tokyo, Japan", "2025-08-15", "2025-08-22", 3, "tokyo-adventure-test"
-            
-            def set_rome_example():
-                return "Rome, Italy", "2025-09-10", "2025-09-17", 1, "rome-classic-test"
-            
-            def set_error_example():
-                return "Invalid Destination 123!@#", "2025-13-45", "2025-13-50", 0, "error-test"
-            
-            example1_btn.click(
-                fn=set_paris_example,
-                outputs=[destination_input, start_date_input, end_date_input, travelers_input, thread_id_input]
-            )
-            example2_btn.click(
-                fn=set_tokyo_example,
-                outputs=[destination_input, start_date_input, end_date_input, travelers_input, thread_id_input]
-            )
-            example3_btn.click(
-                fn=set_rome_example,
-                outputs=[destination_input, start_date_input, end_date_input, travelers_input, thread_id_input]
-            )
-            example4_btn.click(
-                fn=set_error_example,
-                outputs=[destination_input, start_date_input, end_date_input, travelers_input, thread_id_input]
-            )
-            
-            # Connect the main function
-            plan_btn.click(
-                fn=plan_trip_wrapper,
-                inputs=[destination_input, start_date_input, end_date_input, travelers_input, thread_id_input],
-                outputs=trip_output
-            )
+    return [("👋 Start Planning", welcome_message)], session_id
+
+def clear_chat():
+    """Clear the chat and start fresh"""
+    return start_new_session()
+
+# Create the chat interface
+def create_chat_interface():
+    """Create the main chat interface"""
+    with gr.Blocks(title="AI Travel Assistant - Chat") as demo:
+        gr.Markdown("""
+        # 🌍 AI Travel Assistant - Natural Language Chat
         
-        # Tab 2: System Configuration
-        with gr.TabItem("⚙️ System Status"):
-            gr.Markdown(f"""
-            ## 🔧 Current Configuration
-            
-            ### Database & Persistence
-            - **Checkpointer Type:** `{checkpointer_type}`
-            - **Database Location:** `{db_info}`
-            - **State Persistence:** {"✅ Enabled (survives restarts)" if checkpointer_type == "PostgreSQL" else "⚠️ Memory only (lost on restart)"}
-            - **Multi-instance Support:** {"✅ Yes" if checkpointer_type == "PostgreSQL" else "❌ No (single instance only)"}
-            - **Production Ready:** {"✅ Yes" if checkpointer_type == "PostgreSQL" else "🧪 Development only"}
-            
-            ### Agent Architecture
-            - **Framework:** Pure LangGraph (no Temporal dependencies)
-            - **Flight Agent:** ✅ Active
-            - **Accommodation Agent:** ✅ Active  
-            - **Itinerary Agent:** ✅ Active
-            - **Travel Coordinator:** ✅ Active
-            - **Parallel Execution:** ✅ Supported
-            - **Human-in-the-Loop:** ✅ Available
-            
-            ### Environment
-            - **Python Version:** {'.'.join(map(str, [3, 8, 0]))}+
-            - **OpenAI API:** {"✅ Configured" if os.getenv('OPENAI_API_KEY') else "❌ Missing - Set OPENAI_API_KEY"}
-            - **Port:** 7860
-            
-            ---
-            
-            ## 🐘 Enable PostgreSQL Persistence
-            
-            To upgrade to PostgreSQL checkpointing for production-like testing:
-            
-            ```bash
-            # Start PostgreSQL with Docker Compose
-            docker-compose -f docker-compose.local.yml up -d
-            
-            # Verify it's running
-            docker-compose -f docker-compose.local.yml ps
-            
-            # Restart the application
-            python main.py --mode web
-            ```
-            
-            **Benefits of PostgreSQL:**
-            - ✅ State survives application restarts
-            - ✅ Test crash recovery scenarios
-            - ✅ Multi-session isolation
-            - ✅ Full agent state history
-            - ✅ Production-like behavior
-            
-            ---
-            
-            ## 🧪 Testing Guide
-            
-            ### Basic Functionality Test
-            1. Use the "Paris Weekend" quick test
-            2. Verify all agents complete their tasks
-            3. Check the output contains flight, hotel, and itinerary details
-            
-            ### Error Handling Test  
-            1. Click "Error Test" button
-            2. Verify system handles invalid inputs gracefully
-            3. Check error messages are helpful
-            
-            ### State Persistence Test (PostgreSQL only)
-            1. Start a trip planning request
-            2. Note the Thread ID
-            3. Refresh the browser page
-            4. Use the same Thread ID to check if state persists
-            
-            ### Concurrent Sessions Test
-            1. Open multiple browser tabs
-            2. Use different Thread IDs in each tab
-            3. Verify sessions are isolated
-            """)
+        **Talk to your personal AI travel agent in natural language!**
         
-        # Tab 3: Testing Tools
-        with gr.TabItem("🧪 Testing Tools"):
-            gr.Markdown("""
-            ## 🛠️ Development & Testing Tools
+        🔧 **Status:** Memory Checkpointing | 🤖 **Multi-Agent System:** Flight + Hotel + Itinerary
+        """)
+        
+        with gr.Row():
+            with gr.Column(scale=4):
+                # Chat interface
+                chatbot = gr.Chatbot(
+                    value=[],
+                    height=500,
+                    show_label=False,
+                    container=True
+                )
+                
+                with gr.Row():
+                    msg = gr.Textbox(
+                        placeholder="💭 Tell me about your travel plans... (e.g., 'I want to visit Paris next month')",
+                        show_label=False,
+                        scale=4
+                    )
+                    send_btn = gr.Button("Send", variant="primary")
+                
+                with gr.Row():
+                    clear_btn = gr.Button("🗑️ Clear Chat", size="sm")
+                    new_session_btn = gr.Button("🔄 New Session", size="sm")
             
-            ### Run Automated Tests
-            
-            Open a terminal and run these commands for comprehensive testing:
-            """)
-            
-            gr.Code("""
-# Basic functionality tests
-python test_langgraph_agent.py
-
-# Comprehensive durability tests (includes PostgreSQL if available)
-python test_agent_durability.py
-
-# Web UI testing (this interface)
-python main.py web
-
-# Single request testing
-python main.py single --destination "Tokyo, Japan" --start-date "2025-06-01" --end-date "2025-06-07" --travelers 2
-            """, language="bash")
-            
-            gr.Markdown("""
-            ### Manual Testing Checklist
-            
-            #### ✅ Basic Functionality
-            - [ ] Travel planning completes successfully
-            - [ ] All agents (Flight, Hotel, Itinerary) activate
-            - [ ] Results include realistic details
-            - [ ] Thread IDs are properly generated/used
-            
-            #### ✅ Error Handling
-            - [ ] Invalid destinations are handled gracefully
-            - [ ] Malformed dates show helpful errors
-            - [ ] Zero or negative travelers are rejected
-            - [ ] System continues to work after errors
-            
-            #### ✅ State Management
-            - [ ] Different Thread IDs create separate sessions
-            - [ ] Sessions are isolated from each other
-            - [ ] State is preserved (if using PostgreSQL)
-            
-            #### ✅ User Interface
-            - [ ] All buttons and inputs work correctly
-            - [ ] Quick test examples populate fields
-            - [ ] Output is readable and well-formatted
-            - [ ] System status is accurately displayed
-            
-            ### Performance Testing
-            
-            For load testing, use the benchmark mode:
-            """)
-            
-            gr.Code("python main.py --mode benchmark", language="bash")
-            
-            gr.Markdown("""
-            ### Debugging Tips
-            
-            1. **Check Logs:** Look at the console output for detailed agent interactions
-            2. **Thread IDs:** Use descriptive thread IDs to track different test scenarios
-            3. **PostgreSQL:** Use `docker logs langgraph-postgres` to check database logs
-            4. **Agent State:** The system shows completed tasks and agent messages in results
-            
-            ### Common Issues
-            
-            | Issue | Solution |
-            |-------|----------|
-            | "Connection failed" | Check if PostgreSQL is running: `docker-compose ps` |
-            | "OpenAI API error" | Verify `OPENAI_API_KEY` environment variable is set |
-            | "State not persisting" | Make sure PostgreSQL is running, not just memory mode |
-            | "Slow responses" | Normal for first request; subsequent requests are faster |
-            """)
+            with gr.Column(scale=1):
+                gr.Markdown("### 💡 Quick Examples")
+                
+                example1 = gr.Button("🗼 'Plan a trip to Paris'", size="sm")
+                example2 = gr.Button("🍕 'Visit Italy for a week'", size="sm") 
+                example3 = gr.Button("🌸 'Japan trip for 2 people'", size="sm")
+                example4 = gr.Button("🏖️ 'Beach vacation to Bali'", size="sm")
+                
+                gr.Markdown("### ℹ️ How to Chat")
+                gr.Markdown("""
+                **Just talk naturally!**
+                
+                ✅ "I want to go to Tokyo"
+                ✅ "Plan a romantic trip to Paris"
+                ✅ "Family vacation for 4 to Orlando"
+                ✅ "Weekend in Barcelona"
+                
+                I'll understand and help plan your perfect trip!
+                """)
+        
+        # Session state
+        session_state = gr.State()
+        
+        # Initialize session on load
+        demo.load(lambda: start_new_session(), outputs=[chatbot, session_state])
+        
+        # Chat functionality
+        def handle_message(message, history, session_id):
+            if not session_id:
+                session_id = str(uuid.uuid4())
+            return asyncio.run(chat_with_agent(message, history, session_id)), session_id
+        
+        msg.submit(handle_message, [msg, chatbot, session_state], [chatbot, session_state])
+        send_btn.click(handle_message, [msg, chatbot, session_state], [chatbot, session_state])
+        
+        # Clear message after sending
+        msg.submit(lambda: "", outputs=msg)
+        send_btn.click(lambda: "", outputs=msg)
+        
+        # Clear chat
+        clear_btn.click(clear_chat, outputs=[chatbot, session_state])
+        new_session_btn.click(clear_chat, outputs=[chatbot, session_state])
+        
+        # Example buttons
+        def send_example(example_text, history, session_id):
+            return handle_message(example_text, history, session_id)
+        
+        example1.click(lambda h, s: send_example("Plan a trip to Paris", h, s), [chatbot, session_state], [chatbot, session_state])
+        example2.click(lambda h, s: send_example("Visit Italy for a week", h, s), [chatbot, session_state], [chatbot, session_state])
+        example3.click(lambda h, s: send_example("Japan trip for 2 people", h, s), [chatbot, session_state], [chatbot, session_state])
+        example4.click(lambda h, s: send_example("Beach vacation to Bali", h, s), [chatbot, session_state], [chatbot, session_state])
+        
+        return demo
 
 
 def launch_enhanced_ui(share: bool = False, server_port: int = 7860):
-    """Launch the enhanced testing interface"""
-    print(f"\n🚀 Launching LangGraph Travel Agent UI...")
+    """
+    Launch the enhanced natural language chat UI
+    """
+    agent, checkpointer_type, db_info = get_or_create_agent()
+    
+    print("🌐 Starting AI Travel Assistant Chat Interface...")
     print(f"📍 URL: http://localhost:{server_port}")
     print(f"🔧 Checkpointer: {checkpointer_type}")
     print(f"🗄️ Database: {db_info}")
-    print(f"💡 Use the quick test buttons for easy testing!")
+    print(f"💬 Ready for natural language travel conversations!")
     
+    demo = create_chat_interface()
     demo.launch(
         share=share,
         server_port=server_port,
-        show_error=True,
-        show_tips=True
+        show_error=True
     )
 
 

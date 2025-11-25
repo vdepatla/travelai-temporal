@@ -34,13 +34,11 @@ async def create_agent_with_fallback(prefer_postgres: bool = True) -> LangGraphT
         for conn_str in postgres_configs:
             if conn_str:
                 try:
-                    print(f"🔍 Trying PostgreSQL connection...")
                     agent = LangGraphTravelAgent(use_postgres=True, connection_string=conn_str)
                     info = await agent.get_checkpointer_info()
                     if info["type"] == "PostgreSQL":
-                        print(f"✅ Using PostgreSQL for state persistence")
                         return agent
-                except Exception as e:
+                except Exception:
                     continue
         
         print("⚠️  PostgreSQL not available, using memory checkpointing")
